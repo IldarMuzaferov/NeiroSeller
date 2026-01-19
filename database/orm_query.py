@@ -94,26 +94,13 @@ async def orm_get_session_results(session: AsyncSession, session_id: int) -> Lis
 
 
 # ===== UTILITY FUNCTIONS =====
-def normalize_phone_number(phone: str) -> str:
-    """Приводит номер телефона к стандартному формату"""
-    # Убираем все нецифровые символы кроме +
-    cleaned = re.sub(r'[^\d+]', '', phone)
 
-    # Обрабатываем российские номера
-    if cleaned.startswith('8'):
-        cleaned = '7' + cleaned[1:]
-    elif cleaned.startswith('+7'):
-        cleaned = '7' + cleaned[2:]
-    elif cleaned.startswith('7'):
-        cleaned = '7' + cleaned[1:]
-
-    return cleaned
 
 
 def parse_phone_numbers(phone_text: str) -> List[str]:
     """Парсит номера телефонов из текста"""
     phones = phone_text.split()
-    normalized_phones = [normalize_phone_number(phone) for phone in phones]
+    normalized_phones = [phone for phone in phones]
     return [phone for phone in normalized_phones if len(phone) >= 10]
 
 async def orm_get_all_user_sessions(session: AsyncSession, user_id: int) -> List[CallSession]:

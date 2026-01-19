@@ -1,21 +1,20 @@
 import asyncio
-import tempfile
 from datetime import datetime
 
-from aiogram import F, Router, types
-from aiogram.filters import Command, StateFilter
+import httpx
+from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.orm_query import (
     orm_get_user, orm_create_user, orm_create_call_session,
     orm_get_user_sessions, orm_get_session_by_id, orm_update_session,
-    orm_delete_session, parse_phone_numbers, orm_get_session_results, orm_delete_user_sessions_by_status
+    orm_delete_session, parse_phone_numbers, orm_get_session_results,
+    orm_delete_user_sessions_by_status
 )
 from filters.chat_types import ChatTypeFilter, IsAdmin
-from services.uis_client import run_uis_campaign
-
 
 admin_router = Router()
 admin_router.message.filter(ChatTypeFilter(["private"]), IsAdmin())
@@ -29,11 +28,10 @@ class CallSessionStates(StatesGroup):
 
 # ===== KEYBOARDS =====
 def get_main_keyboard():
+    """Главное меню - только 2 кнопки"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📞 Ввести номера", callback_data="input_numbers")],
-            [InlineKeyboardButton(text="📊 Прошлые сеансы", callback_data="past_sessions")],
-            [InlineKeyboardButton(text="⏳ Незаконченные сеансы", callback_data="unfinished_sessions")]
+            [InlineKeyboardButton(text="📞 Новый обзвон", callback_data="input_numbers")],
         ]
     )
 
@@ -41,7 +39,7 @@ def get_main_keyboard():
 def get_back_to_menu_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="↩️ Меню", callback_data="main_menu")]
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main_menu")]
         ]
     )
 
@@ -49,30 +47,11 @@ def get_back_to_menu_keyboard():
 def get_confirm_start_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да", callback_data="confirm_start")],
-            [InlineKeyboardButton(text="↩️ Меню", callback_data="main_menu")]
+            [InlineKeyboardButton(text="✅ Начать обзвон", callback_data="confirm_start")],
+            [InlineKeyboardButton(text="↩️ Отмена", callback_data="main_menu")]
         ]
     )
 
-
-def get_session_actions_keyboard(session_id: int, session_status: str = "draft"):
-    """Клавиатура действий для сеанса"""
-    buttons = []
-
-    if session_status == "draft":
-        # Для черновиков - продолжить и удалить
-        buttons.append([InlineKeyboardButton(text="▶️ Продолжить", callback_data=f"continue_session_{session_id}")])
-        buttons.append([InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"delete_session_{session_id}")])
-    elif session_status == "active":
-        # Для активных сеансов - только просмотр статуса (или ничего)
-        buttons.append([InlineKeyboardButton(text="📊 Посмотреть статус", callback_data=f"view_status_{session_id}")])
-    else:
-        # Для завершенных - просмотр результатов
-        buttons.append(
-            [InlineKeyboardButton(text="📈 Посмотреть результаты", callback_data=f"view_results_{session_id}")])
-
-    buttons.append([InlineKeyboardButton(text="↩️ Назад", callback_data="unfinished_sessions")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ===== MAIN HANDLERS =====
 @admin_router.message(Command("start"))
@@ -89,17 +68,20 @@ async def start_command(message: Message, session: AsyncSession):
         await orm_create_user(session, user_data)
 
     await message.answer(
-        "👋 Добро пожаловать в бот для обзвона!\n\n"
+        "👋 <b>Добро пожаловать в бот для обзвона!</b>\n\n"
         "Выберите действие:",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(),
+        parse_mode="HTML"
     )
 
 
 @admin_router.message(Command("admin"))
 async def admin_command(message: Message, session: AsyncSession):
     await message.answer(
-        "⚙️ Админ панель:",
-        reply_markup=get_main_keyboard()
+        "⚙️ <b>Админ панель</b>\n\n"
+        "Выберите действие:",
+        reply_markup=get_main_keyboard(),
+        parse_mode="HTML"
     )
 
 
@@ -108,9 +90,10 @@ async def admin_command(message: Message, session: AsyncSession):
 async def main_menu_callback(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
-        "👋 Добро пожаловать в бот для обзвона!\n\n"
+        "👋 <b>Добро пожаловать в бот для обзвона!</b>\n\n"
         "Выберите действие:",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(),
+        parse_mode="HTML"
     )
 
 
@@ -118,94 +101,66 @@ async def main_menu_callback(callback: CallbackQuery, session: AsyncSession, sta
 async def input_numbers_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(CallSessionStates.waiting_for_phones)
     await callback.message.edit_text(
-        "📞 Введите номера телефонов через пробел:\n\n"
-        "Пример: +79161234567 84951234567 88002000600\n\n"
-        "Номера могут быть в форматах:\n"
+        "📞 <b>Введите номера телефонов</b>\n\n"
+        "Через пробел или каждый с новой строки:\n\n"
+        "<code>+79161234567 84951234567</code>\n\n"
+        "Поддерживаемые форматы:\n"
         "• +7 916 123-45-67\n"
         "• 8 (916) 123-45-67\n"
         "• 79161234567",
-        reply_markup=get_back_to_menu_keyboard()
+        reply_markup=get_back_to_menu_keyboard(),
+        parse_mode="HTML"
     )
 
 
+# ===== PAST SESSIONS =====
 @admin_router.callback_query(F.data == "past_sessions")
 async def past_sessions_callback(callback: CallbackQuery, session: AsyncSession):
+    """Показывает список прошлых сеансов с датами"""
     user_id = callback.from_user.id
     completed_sessions = await orm_get_user_sessions(session, user_id, status="completed")
 
     if not completed_sessions:
         await callback.message.edit_text(
-            "📊 У вас пока нет завершенных сеансов.",
-            reply_markup=get_back_to_menu_keyboard()
+            "📊 <b>Прошлые сеансы</b>\n\n"
+            "У вас пока нет завершённых сеансов обзвона.",
+            reply_markup=get_back_to_menu_keyboard(),
+            parse_mode="HTML"
         )
         return
 
-    text = "📊 Ваши прошлые сеансы:\n\n"
-    for sess in completed_sessions:
-        text += f"• Сеанс #{sess.id} - {sess.created.strftime('%d.%m.%Y %H:%M')}\n"
+    # Формируем кнопки с датами сеансов
+    buttons = []
+    for sess in completed_sessions[:10]:  # Максимум 10 сеансов
+        # Формат: "29.12 10:00 (5 номеров)"
+        phone_count = len(sess.phone_numbers.split(',')) if sess.phone_numbers else 0
+        date_str = sess.created.strftime('%d.%m %H:%M')
+        button_text = f"📅 {date_str} ({phone_count} ном.)"
+        buttons.append([InlineKeyboardButton(
+            text=button_text,
+            callback_data=f"view_session_{sess.id}"
+        )])
+
+    # Добавляем кнопку удаления всех и возврата в меню
+    if len(completed_sessions) > 0:
+        buttons.append([InlineKeyboardButton(
+            text="🗑 Удалить все сеансы",
+            callback_data="delete_all_past"
+        )])
+    buttons.append([InlineKeyboardButton(text="🏠 В меню", callback_data="main_menu")])
 
     await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                                [InlineKeyboardButton(text=f"Сеанс #{sess.id}",
-                                                      callback_data=f"view_session_{sess.id}")]
-                                for sess in completed_sessions[:5]  # Ограничиваем 5 сеансами
-                            ] + [[InlineKeyboardButton(text="🗑 Удалить все прошлые", callback_data="delete_all_past")]] + [[InlineKeyboardButton(text="↩️ Назад", callback_data="main_menu")]]
-        )
+        f"📊 <b>Прошлые сеансы</b>\n\n"
+        f"Всего завершённых: {len(completed_sessions)}\n"
+        f"Выберите сеанс для просмотра результатов:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
     )
 
-@admin_router.callback_query(F.data == "delete_all_past")
-async def delete_all_past_callback(callback: CallbackQuery, session: AsyncSession):
-    user_id = callback.from_user.id
 
-    deleted = await orm_delete_user_sessions_by_status(
-        session=session,
-        user_id=user_id,
-        statuses=["completed"]   # или как у тебя называется завершённый сеанс
-    )
-
-    await callback.message.edit_text(
-        f"Удалено прошлых сеансов: {deleted}.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
-            ]
-        )
-    )
-
-@admin_router.callback_query(F.data == "unfinished_sessions")
-async def unfinished_sessions_callback(callback: CallbackQuery, session: AsyncSession):
-    user_id = callback.from_user.id
-    # Ищем сеансы со статусами "draft" (черновик) и "active" (активные)
-    unfinished_sessions = await orm_get_user_sessions(session, user_id)
-    unfinished_sessions = [s for s in unfinished_sessions if s.status in ["draft", "active"]]
-
-    if not unfinished_sessions:
-        await callback.message.edit_text(
-            "⏳ У вас нет незаконченных сеансов.",
-            reply_markup=get_back_to_menu_keyboard()
-        )
-        return
-
-    text = "⏳ Ваши незаконченные сеансы:\n\n"
-    for sess in unfinished_sessions:
-        status_text = "Черновик" if sess.status == "draft" else "Активный"
-        text += f"• Сеанс #{sess.id} - {sess.created.strftime('%d.%m.%Y %H:%M')} ({status_text})\n"
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                                [InlineKeyboardButton(
-                                    text=f"Сеанс #{sess.id} ({'Черновик' if sess.status == 'draft' else 'Активный'})",
-                                    callback_data=f"view_unfinished_{sess.id}")]
-                                for sess in unfinished_sessions[:5]
-                            ] + [[InlineKeyboardButton(text="🗑 Удалить все незаконченные", callback_data="delete_all_unfinished")]] + [[InlineKeyboardButton(text="↩️ Назад", callback_data="main_menu")]]
-        )
-    )
 @admin_router.callback_query(F.data.startswith("view_session_"))
-async def view_session(callback: CallbackQuery, session: AsyncSession):
+async def view_session_results(callback: CallbackQuery, session: AsyncSession):
+    """Показывает результаты конкретного сеанса"""
     session_id = int(callback.data.split("_")[2])
     call_session = await orm_get_session_by_id(session, session_id)
 
@@ -213,122 +168,109 @@ async def view_session(callback: CallbackQuery, session: AsyncSession):
         await callback.answer("Сеанс не найден")
         return
 
+    # Получаем результаты звонков
     results = await orm_get_session_results(session, session_id)
+
+    # Считаем статистику
     total = len(results)
     interested = sum(1 for r in results if r.status == "interested")
     not_interested = sum(1 for r in results if r.status == "not_interested")
-    operator_req = sum(1 for r in results if r.status == "operator_request")
-    errors = sum(1 for r in results if r.status == "error")
+    callback_requested = sum(1 for r in results if r.status == "callback_requested")
+    no_answer = sum(1 for r in results if r.status in ["no_answer", "busy", "error"])
 
-    text_lines = [
-        f"📊 Сеанс #{call_session.id}",
-        f"📅 Создан: {call_session.created.strftime('%d.%m.%Y %H:%M')}",
-        f"🔚 Завершён: {call_session.completed_at.strftime('%d.%m.%Y %H:%M') if call_session.completed_at else '—'}",
-        "",
-        f"Всего звонков: {total}",
-        f"✅ Заинтересовались: {interested}",
-        f"⚪️ Не заинтересованы: {not_interested}",
-        f"📞 Попросили оператора: {operator_req}",
-        f"❌ Ошибки/проблемы: {errors}",
-        "",
-        "Детали по номерам:"
+    # Формируем текст результатов
+    text = f"📊 <b>Результаты сеанса</b>\n"
+    text += f"📅 {call_session.created.strftime('%d.%m.%Y %H:%M')}\n\n"
+
+    # Статистика
+    text += f"📞 <b>Всего звонков:</b> {total}\n"
+    if total > 0:
+        text += f"✅ Заинтересованы: {interested} ({interested / total * 100:.0f}%)\n"
+        text += f"❌ Отказы: {not_interested}\n"
+        text += f"📞 Перезвонить: {callback_requested}\n"
+        text += f"📵 Не ответили: {no_answer}\n"
+
+    # Детали по каждому звонку
+    if results:
+        text += "\n<b>Детали:</b>\n"
+
+        status_emoji = {
+            "interested": "✅",
+            "not_interested": "❌",
+            "callback_requested": "📞",
+            "no_answer": "📵",
+            "busy": "⏳",
+            "error": "⚠️",
+        }
+
+        for r in results[:15]:  # Максимум 15 результатов чтобы не превысить лимит
+            emoji = status_emoji.get(r.status, "❓")
+            text += f"\n{emoji} <code>{r.phone_number}</code>"
+            if r.interest_details:
+                text += f"\n   🎯 {r.interest_details[:50]}"
+            if r.notes:
+                # Извлекаем краткий итог из notes
+                notes_lines = r.notes.split('\n')
+                for line in notes_lines:
+                    if line.startswith("Итог:"):
+                        summary = line.replace("Итог:", "").strip()[:60]
+                        text += f"\n   📝 {summary}"
+                        break
+    else:
+        text += "\n<i>Результаты звонков пока не получены</i>"
+
+    # Кнопки
+    buttons = [
+        [InlineKeyboardButton(text="🗑 Удалить сеанс", callback_data=f"delete_session_{session_id}")],
+        [InlineKeyboardButton(text="↩️ К списку сеансов", callback_data="past_sessions")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main_menu")]
     ]
-
-    # подробный список номеров
-    for r in results[:20]:  # ограничим вывод первыми 20 для читаемости
-        line = f"• {r.phone_number} — {r.status}"
-        if r.interest_details:
-            line += f" ({r.interest_details[:60] + '…' if len(r.interest_details) > 60 else r.interest_details})"
-        text_lines.append(line)
-
-    await callback.message.edit_text(
-        "\n".join(text_lines),
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="Удалить сеанс",
-                    callback_data=f"delete_session_{call_session.id}"
-                )],
-                [InlineKeyboardButton(text="↩️ Назад", callback_data="past_sessions")],
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
-            ]
-        )
-    )
-
-@admin_router.callback_query(F.data == "delete_all_unfinished")
-async def delete_all_unfinished_callback(callback: CallbackQuery, session: AsyncSession):
-    user_id = callback.from_user.id
-
-    # считаем незаконченные = draft + active (подстрой под свои статусы)
-    deleted = await orm_delete_user_sessions_by_status(
-        session=session,
-        user_id=user_id,
-        statuses=["draft", "active"]
-    )
-
-    await callback.message.edit_text(
-        f"Удалено незаконченных сеансов: {deleted}.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
-            ]
-        )
-    )
-
-@admin_router.callback_query(F.data.startswith("delete_session_"))
-async def delete_session_callback(callback: CallbackQuery, session: AsyncSession):
-    session_id = int(callback.data.split("_")[2])
-
-    await orm_delete_session(session, session_id)
-
-    await callback.message.edit_text(
-        f"Сеанс #{session_id} удалён.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
-            ]
-        )
-    )
-
-
-# Кнопка "📈 Посмотреть результаты" из блока незаконченных сеансов
-@admin_router.callback_query(F.data.startswith("view_results_"))
-async def view_results(callback: CallbackQuery, session: AsyncSession):
-    # просто переиспользуем тот же хендлер
-    callback.data = callback.data.replace("view_results_", "view_session_")
-    await view_session(callback, session)
-
-
-# Кнопка "📊 Посмотреть статус" для активного сеанса
-@admin_router.callback_query(F.data.startswith("view_status_"))
-async def view_status(callback: CallbackQuery, session: AsyncSession):
-    session_id = int(callback.data.split("_")[2])
-    call_session = await orm_get_session_by_id(session, session_id)
-
-    if not call_session:
-        await callback.answer("Сеанс не найден")
-        return
-
-    results = await orm_get_session_results(session, session_id)
-    total_numbers = len(call_session.phone_numbers.split(","))
-    done = len(results)
-
-    text = (
-        f"🔄 Статус сеанса #{session_id}\n\n"
-        f"Всего номеров: {total_numbers}\n"
-        f"Уже обработано: {done}\n"
-        f"Статус сеанса: {call_session.status}\n"
-    )
 
     await callback.message.edit_text(
         text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="↩️ Назад", callback_data="unfinished_sessions")],
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
-            ]
-        )
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
     )
+
+
+@admin_router.callback_query(F.data == "delete_all_past")
+async def delete_all_past_callback(callback: CallbackQuery, session: AsyncSession):
+    """Удаляет все прошлые сеансы"""
+    user_id = callback.from_user.id
+
+    deleted = await orm_delete_user_sessions_by_status(
+        session=session,
+        user_id=user_id,
+        statuses=["completed"]
+    )
+
+    await callback.message.edit_text(
+        f"🗑 <b>Удалено сеансов:</b> {deleted}\n\n"
+        "Все прошлые сеансы очищены.",
+        reply_markup=get_back_to_menu_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+@admin_router.callback_query(F.data.startswith("delete_session_"))
+async def delete_session(callback: CallbackQuery, session: AsyncSession):
+    """Удаляет конкретный сеанс"""
+    session_id = int(callback.data.split("_")[2])
+
+    success = await orm_delete_session(session, session_id)
+    if success:
+        await callback.message.edit_text(
+            "✅ Сеанс успешно удалён",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ К списку сеансов", callback_data="past_sessions")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main_menu")]
+            ]),
+            parse_mode="HTML"
+        )
+    else:
+        await callback.answer("Ошибка при удалении сеанса")
+
+
 # ===== STATE HANDLERS =====
 @admin_router.message(CallSessionStates.waiting_for_phones)
 async def process_phone_numbers(message: Message, state: FSMContext, session: AsyncSession):
@@ -337,7 +279,7 @@ async def process_phone_numbers(message: Message, state: FSMContext, session: As
 
     if not phones:
         await message.answer(
-            "❌ Не удалось распознать номера телефонов. "
+            "❌ Не удалось распознать номера телефонов.\n\n"
             "Пожалуйста, введите номера через пробел:",
             reply_markup=get_back_to_menu_keyboard()
         )
@@ -347,8 +289,15 @@ async def process_phone_numbers(message: Message, state: FSMContext, session: As
     await state.set_state(CallSessionStates.waiting_for_knowledge)
 
     await message.answer(
-        "📚 Теперь введите базу знаний (название компании, услуги, описание):",
-        reply_markup=get_back_to_menu_keyboard()
+        f"✅ Распознано номеров: {len(phones)}\n\n"
+        "📚 <b>Теперь введите информацию о компании</b>\n\n"
+        "Напишите:\n"
+        "• Название компании\n"
+        "• Какие услуги/товары предлагаете\n"
+        "• Контактные данные\n"
+        "• Любую другую важную информацию",
+        reply_markup=get_back_to_menu_keyboard(),
+        parse_mode="HTML"
     )
 
 
@@ -357,12 +306,12 @@ async def process_knowledge_base(message: Message, state: FSMContext, session: A
     knowledge_base = message.text
     data = await state.get_data()
 
-    # Создаем черновик сеанса
+    # Создаем сеанс сразу со статусом draft
     session_data = {
         "user_id": message.from_user.id,
         "phone_numbers": ",".join(data['phone_numbers']),
         "knowledge_base": knowledge_base,
-        "status": "draft",  # Черновик
+        "status": "draft",
         "name": f"Сеанс от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     }
 
@@ -375,78 +324,18 @@ async def process_knowledge_base(message: Message, state: FSMContext, session: A
     await state.set_state(CallSessionStates.confirming_start)
 
     phone_count = len(data['phone_numbers'])
+    phones_preview = ", ".join(data['phone_numbers'][:3])
+    if phone_count > 3:
+        phones_preview += f" и ещё {phone_count - 3}"
 
     await message.answer(
-        f"📋 Проверьте данные:\n\n"
-        f"📞 Номера: <code>{call_session.phone_numbers}</code>\n"
-        f"📚 База знаний: {knowledge_base[:100]}{'...' if len(knowledge_base) > 100 else ''}\n\n"
+        f"📋 <b>Проверьте данные:</b>\n\n"
+        f"📞 <b>Номера ({phone_count}):</b>\n<code>{phones_preview}</code>\n\n"
+        f"📚 <b>О компании:</b>\n{knowledge_base[:200]}{'...' if len(knowledge_base) > 200 else ''}\n\n"
         f"Начать обзвон?",
         reply_markup=get_confirm_start_keyboard(),
         parse_mode="HTML",
     )
-
-# ===== SESSION MANAGEMENT HANDLERS =====
-@admin_router.callback_query(F.data.startswith("view_unfinished_"))
-async def view_unfinished_session(callback: CallbackQuery, session: AsyncSession):
-    session_id = int(callback.data.split("_")[2])
-    call_session = await orm_get_session_by_id(session, session_id)
-
-    if not call_session:
-        await callback.answer("Сеанс не найден")
-        return
-
-    phone_count = len(call_session.phone_numbers.split(','))
-
-    await callback.message.edit_text(
-        f"⏳ Незаконченный сеанс #{session_id}\n\n"
-        f"📞 Номера: <code>{call_session.phone_numbers}</code>\n"
-        f"📚 База знаний: {call_session.knowledge_base[:200]}{'...' if len(call_session.knowledge_base) > 200 else ''}\n"
-        f"📅 Создан: {call_session.created.strftime('%d.%m.%Y %H:%M')}\n"
-        f"🔄 Статус: {'Черновик' if call_session.status == 'draft' else 'Активный'}",
-        reply_markup=get_session_actions_keyboard(session_id, call_session.status),
-        parse_mode="HTML"
-    )
-
-@admin_router.callback_query(F.data.startswith("continue_session_"))
-async def continue_session(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
-    session_id = int(callback.data.split("_")[2])
-    call_session = await orm_get_session_by_id(session, session_id)
-
-    if not call_session:
-        await callback.answer("Сеанс не найден")
-        return
-
-    await state.update_data(
-        phone_numbers=call_session.phone_numbers.split(','),
-        knowledge_base=call_session.knowledge_base,
-        existing_session_id=session_id
-    )
-    await state.set_state(CallSessionStates.confirming_start)
-
-    phone_count = len(call_session.phone_numbers.split(','))
-
-    await callback.message.edit_text(
-        f"📋 Продолжение сеанса #{session_id}:\n\n"
-        f"📞 Номера: <code>{call_session.phone_numbers}</code>\n"
-        f"📚 База знаний: {call_session.knowledge_base[:100]}{'...' if len(call_session.knowledge_base) > 100 else ''}\n\n"
-        f"Начать обзвон?",
-        reply_markup=get_confirm_start_keyboard(),
-        parse_mode="HTML"
-    )
-
-
-@admin_router.callback_query(F.data.startswith("delete_session_"))
-async def delete_session(callback: CallbackQuery, session: AsyncSession):
-    session_id = int(callback.data.split("_")[2])
-
-    success = await orm_delete_session(session, session_id)
-    if success:
-        await callback.message.edit_text(
-            "✅ Сеанс успешно удален",
-            reply_markup=get_back_to_menu_keyboard()
-        )
-    else:
-        await callback.answer("Ошибка при удалении сеанса")
 
 
 @admin_router.callback_query(F.data == "confirm_start")
@@ -462,9 +351,6 @@ async def confirm_start_callback(callback: CallbackQuery, state: FSMContext, ses
     if 'draft_session_id' in data:
         await orm_update_session(session, data['draft_session_id'], session_data)
         session_id = data['draft_session_id']
-    elif 'existing_session_id' in data:
-        await orm_update_session(session, data['existing_session_id'], session_data)
-        session_id = data['existing_session_id']
     else:
         new_session_data = {
             "user_id": callback.from_user.id,
@@ -483,16 +369,86 @@ async def confirm_start_callback(callback: CallbackQuery, state: FSMContext, ses
     await state.clear()
 
     await callback.message.edit_text(
-        f"🚀 Начинаем обзвон сеанса #{session_id}!\n\n"
-        f"📞 Номера: {len(phones)} шт.\n"
-        f"⏳ Статус: запускается.\n\n"
-        "Результаты будут доступны в разделе «Прошлые сеансы».",
-        reply_markup=get_back_to_menu_keyboard()
+        f"🚀 <b>Обзвон запущен!</b>\n\n"
+        f"📞 Номеров: {len(phones)}\n"
+        f"⏳ Статус: выполняется\n\n"
+        "Результаты каждого звонка будут приходить сюда.\n"
+        "Итоговая статистика — в разделе «Прошлые сеансы».",
+        reply_markup=get_back_to_menu_keyboard(),
+        parse_mode="HTML"
     )
 
-    # Стартуем кампанию в фоне, чтобы не блокировать обработчик Telegram
+    # Запускаем звонки с базой знаний и user_id
     asyncio.create_task(
-        run_uis_campaign(call_session_id=session_id, phones=phones, knowledge_base=knowledge_base)
+        run_call_campaign(
+            session_id=session_id,
+            phones=phones,
+            knowledge_base=knowledge_base,
+            user_id=callback.from_user.id
+        )
     )
 
 
+# ===== CALL FUNCTIONS =====
+async def run_call_campaign(session_id: int, phones: list, knowledge_base: str, user_id: int):
+    """
+    Запускает кампанию обзвона.
+    Обзванивает все номера последовательно.
+    Статус сессии обновляется автоматически через API после каждого звонка.
+    """
+    for i, phone in enumerate(phones):
+        try:
+            print(f"📞 Звонок {i + 1}/{len(phones)}: {phone}")
+            await initiate_call_to_api(
+                phone=phone,
+                knowledge_base=knowledge_base,
+                db_session_id=session_id,
+                user_id=user_id
+            )
+            # Пауза между звонками (ждём завершения текущего)
+            # Звонок длится ~30-60 секунд
+            await asyncio.sleep(45)
+        except Exception as e:
+            print(f"❌ Ошибка при звонке на {phone}: {e}")
+
+    print(f"✅ Кампания {session_id} завершена: {len(phones)} звонков")
+
+
+async def initiate_call_to_api(
+        phone: str,
+        knowledge_base: str = "",
+        db_session_id: int = None,
+        user_id: int = None,
+        greeting: str = None
+):
+    """
+    Инициирует звонок через FastAPI эндпоинт.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            call_data = {
+                "phone": phone,
+                "knowledge_base": knowledge_base,
+                "db_session_id": db_session_id,
+                "user_id": user_id,
+            }
+
+            if greeting:
+                call_data["greeting"] = greeting
+
+            response = await client.post(
+                "http://127.0.0.1:8000/call",
+                json=call_data
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                print(f"✅ Звонок на {phone} инициирован: {result}")
+                return result
+            else:
+                print(f"❌ Ошибка при звонке на {phone}: {response.status_code} - {response.text}")
+                return None
+
+    except Exception as e:
+        print(f"❌ Ошибка подключения к API: {e}")
+        return None
