@@ -98,7 +98,7 @@ CallSeller/
 ### 1. Клонировать репозиторий
 
 ```bash
-git clone https://github.com/<your-username>/CallSeller.git
+git clone https://github.com/IldarMuzaferov/NeiroSeller.git
 cd CallSeller
 ```
 
@@ -323,7 +323,5 @@ curl http://localhost:1111/health
 - [ ] Добавить экспорт результатов в CSV/XLSX.
 - [ ] Покрыть CRUD и обработчики тестами.
 
-## Лицензия
 
-Лицензия не указана. Если проект планируется публиковать, добавьте файл `LICENSE`.
 
