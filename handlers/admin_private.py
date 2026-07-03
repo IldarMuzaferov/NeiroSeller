@@ -437,7 +437,7 @@ async def initiate_call_to_api(
                 call_data["greeting"] = greeting
 
             response = await client.post(
-                "http://127.0.0.1:8000/call",
+                "https://neiroagent007.ru/call",
                 json=call_data
             )
 
